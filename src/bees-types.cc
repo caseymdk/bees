@@ -358,13 +358,17 @@ BeesRangePair::grow(shared_ptr<BeesContext> ctx, bool constrained)
 	// We should not be overlapping already
 	THROW_CHECK2(invalid_argument, first, second, !first.overlaps(second));
 
+	// Get extent info for destination file
 	BtrfsExtentWalker ew_second(second.fd());
-
-	// Stop on aligned extent boundary
 	ew_second.seek(second.begin());
-
 	Extent e_second = ew_second.current();
 	BEESTRACE("e_second " << e_second);
+
+	// Get extent info for source file too - needed for backward extension limits
+	BtrfsExtentWalker ew_first(first.fd());
+	ew_first.seek(first.begin());
+	Extent e_first = ew_first.current();
+	BEESTRACE("e_first " << e_first);
 
 	// Preread entire extent
 	bees_readahead_pair(second.fd(), e_second.begin(), e_second.size(),
@@ -372,101 +376,120 @@ BeesRangePair::grow(shared_ptr<BeesContext> ctx, bool constrained)
 
 	auto hash_table = ctx->hash_table();
 
-	// Look backward
-	BEESTRACE("grow_backward " << *this);
-	while (first.size() < BLOCK_SIZE_MAX_EXTENT) {
-		if (second.begin() <= e_second.begin()) {
-#if 0
-			if (constrained) {
-				break;
+	// Extend backward using FORWARD scanning (much faster due to readahead/caching)
+	//
+	// Instead of iterating backward block-by-block (which is slow because it defeats
+	// readahead and cache prefetching), we:
+	// 1. Calculate the earliest possible start position based on extent boundaries
+	// 2. Scan FORWARD from that position, comparing blocks
+	// 3. Find the first position where blocks match continuously to current position
+	//
+	// This is the same number of comparisons but with sequential forward I/O,
+	// which is much faster than backward I/O.
+	BEESTRACE("grow_backward (forward scan) " << *this);
+
+	// Calculate how far back we could potentially extend, limited by:
+	// - Extent boundaries for both files
+	// - Size limit (BLOCK_SIZE_MAX_EXTENT)
+	// - Beginning of files (offset 0)
+	// - Ranges must not overlap
+	const off_t max_backward_first = first.begin() - e_first.begin();
+	const off_t max_backward_second = second.begin() - e_second.begin();
+	const off_t max_backward_size = BLOCK_SIZE_MAX_EXTENT - first.size();
+	off_t max_backward = min(max_backward_first, min(max_backward_second, max_backward_size));
+
+	// Also limit by potential overlap between ranges
+	if (!first.overlaps(second)) {
+		// Ranges don't overlap - check if backward extension would cause overlap
+		if (first.end() <= second.begin()) {
+			// first is entirely before second
+			max_backward = min(max_backward, second.begin() - first.end());
+		} else if (second.end() <= first.begin()) {
+			// second is entirely before first
+			max_backward = min(max_backward, first.begin() - second.end());
+		}
+	}
+
+	// Align to block boundary
+	max_backward = (max_backward / BLOCK_SIZE_CLONE) * BLOCK_SIZE_CLONE;
+
+	BEESTRACE("max_backward = " << max_backward << " (first extent: " << e_first << ", second extent: " << e_second << ")");
+
+	if (max_backward > 0) {
+		// Calculate the potential start positions
+		const off_t potential_first_begin = first.begin() - max_backward;
+		const off_t potential_second_begin = second.begin() - max_backward;
+
+		// Scan FORWARD from potential start to find where matching data begins.
+		// We're looking for the last mismatch before the current match point.
+		// The matching range starts right after the last mismatch.
+		off_t scan_first = potential_first_begin;
+		off_t scan_second = potential_second_begin;
+		off_t match_start_first = first.begin();   // Default: no backward extension
+		off_t match_start_second = second.begin();
+
+		while (scan_first < first.begin()) {
+			BEESCOUNT(pairbackward_try);
+
+			BeesBlockData first_bbd(first.fd(), scan_first, BLOCK_SIZE_CLONE);
+			BeesBlockData second_bbd(second.fd(), scan_second, BLOCK_SIZE_CLONE);
+
+			bool block_ok = true;
+
+			// Check if blocks have identical content
+			if (!first_bbd.is_data_equal(second_bbd)) {
+				BEESCOUNT(pairbackward_miss);
+				block_ok = false;
 			}
-			BEESCOUNT(pairbackward_extent);
-			ew_second.seek(second.begin() - min(BLOCK_SIZE_CLONE, second.begin()));
-			e_second = ew_second.current();
-			if (e_second.flags() & Extent::HOLE) {
-				BEESCOUNT(pairbackward_hole);
-				break;
+
+			// Check physical blocks are distinct (if content matched)
+			if (block_ok && first_bbd.addr().get_physical_or_zero() == second_bbd.addr().get_physical_or_zero()) {
+				BEESCOUNT(pairbackward_same);
+				block_ok = false;
 			}
-			bees_readahead(second.fd(), e_second.begin(), e_second.size());
-#else
-			// This tends to repeatedly process extents that were recently processed.
-			// We tend to catch duplicate blocks early since we scan them forwards.
-			// Also, reading backwards is slow so we probably don't want to do it much.
-			break;
-#endif
-		}
-		BEESCOUNT(pairbackward_try);
 
-		// Extend first range.  If we hit BOF we can go no further.
-		BeesFileRange new_first = first;
-		BEESTRACE("new_first = " << new_first);
-		new_first.grow_begin(BLOCK_SIZE_CLONE);
-		if (new_first.begin() == first.begin()) {
-			BEESCOUNT(pairbackward_bof_first);
-			break;
-		}
-
-		// Extend second range.  If we hit BOF we can go no further.
-		BeesFileRange new_second = second;
-		BEESTRACE("new_second = " << new_second);
-		new_second.grow_begin(BLOCK_SIZE_CLONE);
-		if (new_second.begin() == second.begin()) {
-			BEESCOUNT(pairbackward_bof_second);
-			break;
-		}
-
-		// If the ranges now overlap we went too far
-		if (new_first.overlaps(new_second)) {
-			BEESCOUNT(pairbackward_overlap);
-			break;
-		}
-
-		BEESTRACE("first " << first << " new_first " << new_first);
-		BeesBlockData first_bbd(first.fd(), new_first.begin(), first.begin() - new_first.begin());
-		BEESTRACE("first_bbd " << first_bbd);
-		BEESTRACE("second " << second << " new_second " << new_second);
-		BeesBlockData second_bbd(second.fd(), new_second.begin(), second.begin() - new_second.begin());
-		BEESTRACE("second_bbd " << second_bbd);
-
-		// Both blocks must have identical content
-		if (!first_bbd.is_data_equal(second_bbd)) {
-			BEESCOUNT(pairbackward_miss);
-			break;
-		}
-
-		// Physical blocks must be distinct
-		if (first_bbd.addr().get_physical_or_zero() == second_bbd.addr().get_physical_or_zero()) {
-			BEESCOUNT(pairbackward_same);
-			break;
-		}
-
-		// Source block cannot be zero in a non-compressed non-magic extent
-		BeesAddress first_addr(first.fd(), new_first.begin());
-		if (first_bbd.is_data_zero() && !first_addr.is_magic() && !first_addr.is_compressed()) {
-			BEESCOUNT(pairbackward_zero);
-			break;
-		}
-
-		// Source block cannot have a toxic hash
-		auto found_hashes = hash_table->find_cell(first_bbd.hash());
-		bool found_toxic = false;
-		for (auto i : found_hashes) {
-			if (BeesAddress(i.e_addr).is_toxic()) {
-				found_toxic = true;
-				break;
+			// Check source block is not zero in non-compressed extent
+			if (block_ok) {
+				BeesAddress first_addr(first.fd(), scan_first);
+				if (first_bbd.is_data_zero() && !first_addr.is_magic() && !first_addr.is_compressed()) {
+					BEESCOUNT(pairbackward_zero);
+					block_ok = false;
+				}
 			}
-		}
-		if (found_toxic) {
-			BEESLOGDEBUG("WORKAROUND: found toxic hash in " << first_bbd << " while extending backward:\n" << *this);
-			BEESCOUNT(pairbackward_toxic_hash);
-			break;
+
+			// Check for toxic hash
+			if (block_ok) {
+				auto found_hashes = hash_table->find_cell(first_bbd.hash());
+				for (auto i : found_hashes) {
+					if (BeesAddress(i.e_addr).is_toxic()) {
+						BEESCOUNT(pairbackward_toxic_hash);
+						block_ok = false;
+						break;
+					}
+				}
+			}
+
+			if (block_ok) {
+				// This block matches - it could be part of the extended range
+				// But we need to keep scanning to make sure all blocks up to
+				// the current position also match
+				BEESCOUNT(pairbackward_hit);
+			} else {
+				// Mismatch found - matching range can start after this block
+				match_start_first = scan_first + BLOCK_SIZE_CLONE;
+				match_start_second = scan_second + BLOCK_SIZE_CLONE;
+			}
+
+			scan_first += BLOCK_SIZE_CLONE;
+			scan_second += BLOCK_SIZE_CLONE;
 		}
 
-		THROW_CHECK2(invalid_argument, new_first.size(), new_second.size(), new_first.size() == new_second.size());
-		first = new_first;
-		second = new_second;
-		rv = true;
-		BEESCOUNT(pairbackward_hit);
+		// Extend the range backward to match_start if we found matching blocks
+		if (match_start_first < first.begin()) {
+			first = BeesFileRange(first.fd(), match_start_first, first.end());
+			second = BeesFileRange(second.fd(), match_start_second, second.end());
+			rv = true;
+		}
 	}
 	BEESCOUNT(pairbackward_stop);
 	BEESCOUNTADD(pairbackward_ms, grow_backward_timer.age() * 1000);
@@ -474,6 +497,7 @@ BeesRangePair::grow(shared_ptr<BeesContext> ctx, bool constrained)
 	// Look forward
 	BEESTRACE("grow_forward " << *this);
 	Timer grow_forward_timer;
+
 	while (first.size() < BLOCK_SIZE_MAX_EXTENT) {
 		if (second.end() >= e_second.end()) {
 			if (constrained) {

@@ -234,20 +234,16 @@ The `open` event group consists of operations related to translating `(root, ino
 pairbackward
 ------------
 
-The `pairbackward` event group consists of events related to extending matching block ranges backward starting from the initial block match found using the hash table.
+The `pairbackward` event group consists of events related to extending matching block ranges backward starting from the initial block match found using the hash table.  Note: backward extension is implemented using forward scanning from the extent boundary for better I/O performance (sequential reads benefit from readahead).
 
- * `pairbackward_bof_first`: A matching pair of block ranges could not be extended backward because the beginning of the first (src) file was reached.
- * `pairbackward_bof_second`: A matching pair of block ranges could not be extended backward because the beginning of the second (dst) file was reached.
- * `pairbackward_hit`: A pair of matching block ranges was extended backward by one block.
- * `pairbackward_miss`: A pair of matching block ranges could not be extended backward by one block because the pair of blocks before the first block in the range did not contain identical data.
+ * `pairbackward_hit`: A block was checked during backward extension and matched (identical content, distinct physical blocks, not zero, not toxic).
+ * `pairbackward_miss`: A block was checked during backward extension and did not match due to different content.
  * `pairbackward_ms`: Total time spent extending matching block ranges backward from the first matching block found by hash table lookup.
- * `pairbackward_overlap`: A pair of matching block ranges could not be extended backward by one block because this would cause the two block ranges to overlap.
- * `pairbackward_same`: A pair of matching block ranges could not be extended backward by one block because this would cause the two block ranges to refer to the same btrfs data extent.
- * `pairbackward_stop`: Stopped extending a pair of matching block ranges backward for any of the reasons listed here.
- * `pairbackward_toxic_addr`: A pair of matching block ranges was abandoned because the extended range would include a data block with a toxic address.
- * `pairbackward_toxic_hash`: A pair of matching block ranges was abandoned because the extended range would include a data block with a toxic hash.
- * `pairbackward_try`: Started extending a pair of matching block ranges backward.
- * `pairbackward_zero`: A pair of matching block ranges could not be extended backward by one block because the src block contained all zeros and was not compressed.
+ * `pairbackward_same`: A block was checked during backward extension but both ranges refer to the same btrfs data extent.
+ * `pairbackward_stop`: Stopped extending a pair of matching block ranges backward.
+ * `pairbackward_toxic_hash`: A block was checked during backward extension but has a toxic hash.
+ * `pairbackward_try`: Checked a block during backward extension (scanning forward from extent boundary).
+ * `pairbackward_zero`: A block was checked during backward extension but the src block contained all zeros and was not compressed.
 
 pairforward
 -----------
